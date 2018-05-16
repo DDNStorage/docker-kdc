@@ -1,42 +1,38 @@
 #!/bin/bash
 #
-# Docker Containerized Kerberos KDC.
+# Lustre-specific Docker container for a Heimdal Kerberos 5 KDC
 #
 # This should be a pretty good start for building your own docker container
-# of a KDC.
-# Due to the fact that OSX docker is running in a VM, things get a bit
-# complicated.
+# of a Lustre-specific KDC.
 #
-# Latest version is located at: https://github.com/tillt/docker-kdc
+# Latest version is located at:
+# https://github.com/DDNStorage/lustre-docker-kdc/tree/for_lustre
 #
 
 # KDC hostname.
 KDC_HOST_NAME=${KDC_HOST_NAME:-'kdc'}
-# External KDC IP.
-KDC_NATHOST=${KDC_NATHOST:-'127.0.0.1'}
-# External KDC port.
-KDC_PORT=${KDC_PORT:-'48088'}
 # Config file.
 KDC_CONFIG=${KDC_CONFIG:-'kdc.json'}
-# Temmplates source dir.
+# Templates source dir.
 KDC_TEMPLATES_DIR=${KDC_TEMPLATES_DIR:-'templates'}
 
 # Default principal.
-KDC_PRINCIPAL=${KDC_PRINCIPAL:-'tillt'}
+KDC_PRINCIPAL=${KDC_PRINCIPAL:-'lustre_root'}
 # Default password.
-KDC_PASSWORD=${KDC_PASSWORD:-'matilda'}
+KDC_PASSWORD=${KDC_PASSWORD:-'dumb'}
 # Host requesting authentication.
-# Default derived from hostname -s.
-KDC_CLIENT=${KDC_CLIENT:-$(hostname -s)}
 # Kerberos domain name.
 # Default derived from fully qualified domain-name of the host.
 # Using backtick operator to prevent sublime's highlighting from freaking out.
 DEFAULT=`hostname -f | 							\
 	awk -F. '{$1="";OFS="." ; print $0 ; OFS=""}' |			\
 	sed 's/^.//'`
-KDC_DOMAIN_NAME=${KDC_DOMAIN_NAME:-$DEFAULT}
 
 # Try read and parse the setup from a JSON file.
+if ! type jq >/dev/null 2>&1; then
+	echo "jq is required, please install (from EPEL)."
+	exit 2
+fi
 if [ -e $KDC_CONFIG ]; then
 	status=$(cat $KDC_CONFIG | jq 'has("ip")')
 	if [[ $status == "true" ]]; then
@@ -70,86 +66,89 @@ if [ -e $KDC_CONFIG ]; then
 			jq '.principals[] | .id+" "+.password'))
 		IFS=$OLD_IFS
 	fi
+else
+	echo "Cannot find config file $KDC_CONFIG"
+	exit 2
 fi
 
+KDC_DOMAIN_NAME=${KDC_DOMAIN_NAME:-$DEFAULT}
 DEFAULT=`echo $KDC_DOMAIN_NAME | awk '{print toupper($0)}'`
 # Kerberos realm name.
 # Default derived from KDC_DOMAIN_NAME.
 KDC_REALM_NAME=${KDC_REALM_NAME:-$DEFAULT}
 
-# If we did not get any principals from our configuration, render a default.
+# If we did not get any principals from our configuration, return error.
 if [ ${#KDC_PRINCIPALS[@]} -eq 0 ]; then
-	# Render a default principal/password array for allowing a simple setup.
-	KDC_PRINCIPALS=("$KDC_PRINCIPAL/$KDC_CLIENT.$KDC_DOMAIN_NAME@$KDC_REALM_NAME $KDC_PASSWORD")
+	echo "Cannot find any principal in $KDC_CONFIG"
+	exit 22
 fi
 
 
-DOCKERIMAGE='tillt/docker-kdc:latest'
+DOCKERIMAGE='ddnstorage/lustre-docker-kdc:latest'
 CONTAINER='docker'
-CONTROL_VM='VBoxManage controlvm boot2docker-vm'
 GET_KDC_HOST="echo $KDC_NATHOST"
-
-# Adjust container in case of OSX.
-if [[ $OSTYPE =~ darwin.+ ]]; then
-	CONTAINER='boot2docker'
-	GET_KDC_HOST='boot2docker ip'
-fi
-
-
-# Start boot2docker if not running and create port forwarding rules for OSX.
-function prepareDocker {
-	if [[ $CONTAINER == "boot2docker" ]]; then
-		boot2docker status &> /dev/null || boot2docker init
-		if [[ `boot2docker status` == "poweroff" ]]; then
-			boot2docker up
-			setupPortForward
-		fi
-		`$(boot2docker shellinit)`
-	fi
-}
-
-
-# Port forwarding setup for OSX.
-function setupPortForward {
-	$CONTROL_VM natpf1 delete "$KDC_PORT/tcp" &> /dev/null
-	$CONTROL_VM natpf1 delete "$KDC_PORT/udp" &> /dev/null
-	$CONTROL_VM natpf1 "$KDC_PORT/tcp,tcp,$KDC_NATHOST,$KDC_PORT,,$KDC_PORT"
-	$CONTROL_VM natpf1 "$KDC_PORT/udp,udp,$KDC_NATHOST,$KDC_PORT,,$KDC_PORT"
-}
-
-
-# Port forwarding teardown for OSX.
-function deletePortForward {
-	$CONTROL_VM natpf1 delete "$KDC_PORT/tcp" &> /dev/null
-	$CONTROL_VM natpf1 delete "$KDC_PORT/udp" &> /dev/null
-}
 
 
 # Start docker container.
-# Also renders a temporary KDC configuration file and exports the keytab.
+# Also render a temporary KDC configuration file and export the keytab files.
 function startDocker {
+	docker inspect --type=image $DOCKERIMAGE 2>/dev/null 1>&2
+	if [ "$?" -ne 0 ]; then
+		echo ""
+		echo "Docker image $DOCKERIMAGE does not exist. Please make sure to run '$0 build' before."
+		echo ""
+		exit 2
+	fi
+
 	echo "Kerberos KDC container starting..."
 	docker run -d -h $KDC_HOST_NAME					\
 		-p $KDC_PORT:88	 					\
 		-p $KDC_PORT:88/udp 					\
 		--name=$KDC_HOST_NAME 					\
-		$DOCKERIMAGE
+		$DOCKERIMAGE > /dev/null
+
+	if [ "$?" -ne 0 ]; then
+		echo ""
+		echo "Kerberos KDC could not be started."
+		echo ""
+		exit 3
+	fi
 
 	local KDC_HOST=`$GET_KDC_HOST`
 	echo ""
 	echo "Kerberos KDC now reachable at '$KDC_HOST:$KDC_PORT'"
 	echo ""
 
-	sed -e "s/HOST_NAME/$KDC_HOST:$KDC_PORT/g"			\
+	if [ -z "$KDC_DOMAIN_NAME" ]; then
+		sed "/DOMAIN_NAME/d" "$KDC_TEMPLATES_DIR/krb5.conf" >   \
+		krb5.conf
+	else
+		cp "$KDC_TEMPLATES_DIR/krb5.conf" krb5.conf
+	fi
+	sed -i -e "s/HOST_NAME/$KDC_HOST:$KDC_PORT/g"			\
 		-e "s/DOMAIN_NAME/$KDC_DOMAIN_NAME/g" 			\
 		-e "s/REALM_NAME/$KDC_REALM_NAME/g"			\
-		"$KDC_TEMPLATES_DIR/krb5.conf" >krb5.conf
+		krb5.conf
 
-	docker cp $KDC_HOST_NAME:/etc/docker-kdc/krb5.keytab .
+	docker cp $KDC_HOST_NAME:/etc/lustre-docker-kdc/Keytabs . || exit 2
 
-	echo "For using the KDC, make sure you use the following environment:"
-	echo "    export KRB5_CONFIG=$(pwd)/krb5.conf"
-	echo "    export KRB5_KTNAME=$(pwd)/krb5.keytab"
+	echo "For using the KDC with Lustre, copy following files on corresponding nodes:"
+	echo "    * to /etc/krb5.conf:"
+	echo "        - $(pwd)/krb5.conf on all server and clients nodes"
+	echo "    * to /etc/krb5.keytab:"
+	echo "        - MDS: $(pwd)/Keytabs/krb5.keytab.lustre_mds_<host>@<domain>"
+	echo "        - OSS: $(pwd)/Keytabs/krb5.keytab.lustre_oss_<host>@<domain>"
+	echo "        - clients: $(pwd)/Keytabs/krb5.keytab.lustre_root_<host>@<domain>"
+	echo ""
+	echo "Then, as simple as A-B-C, setup Lustre in 3 steps:"
+	echo "    * on all Lustre nodes (servers, clients), declare the program to emit authentication requests."
+	echo "      This is simply done by creating the file /etc/request-key.d/lgssc.conf with the following content:"
+	echo "        create lgssc * * /usr/sbin/lgss_keyring %o %k %t %d %c %u %g %T %P %S"
+	echo "    * on server nodes only (MDS, OSS), start the daemon that is responsible for checking authentication"
+	echo "      credentials. Directly run in a shell:"
+	echo "      # lsvcgssd -vv -k"
+	echo "    * on MGS node, activate Kerberos authentication for your file system. From a shell, launch:"
+	echo "      # lctl conf_param <fsname>.srpc.flavor.default=krb5n"
 	echo ""
 }
 
@@ -158,23 +157,26 @@ function startDocker {
 function stopDocker {
 	docker stop $KDC_HOST_NAME &> /dev/null
 	docker rm $KDC_HOST_NAME &> /dev/null
-	if [[ $CONTAINER == "boot2docker" ]]; then
-		deletePortForward
-		[[ `boot2docker status` == "running" ]] && boot2docker down
-	fi
 	rm -f krb5.conf
-	rm -f krb5.keytab
-	echo "Kerberos KDC stopped and removed"
+	rm -rf Keytabs
+	echo "Kerberos KDC stopped and removed, and keytab files removed."
+	echo "Please make sure to remove potential credential caches /tmp/krb5cc_lustre* on all Lustre nodes."
 }
 
 
 # Render docker container image.
 function buildImage {
 	local RENDER_PRINCIPAL="RUN kadmin -l add --password=PASSWORD --use-defaults PRINCIPAL"
-	local EXPORT_KEYTAB="RUN kadmin -l ext_keytab -k /etc/docker-kdc/krb5.keytab"
+	local EXPORT_KEYTAB_CMD="RUN kadmin -l ext_keytab -k /etc/lustre-docker-kdc/Keytabs/krb5.keytab"
+	local -a EXPORT_KEYTAB_LIST
+	local IDX=0
+
+	if ! type docker >/dev/null 2>&1; then
+		echo "docker is required, please install."
+		exit 2
+	fi
 
 	# Use a temporary file for the add principal directives.
-	# TODO(tillt): This seems unclean - find a better way.
 	local TEMP_PRINCIPALS="_principals.txt"
 	for principal in "${KDC_PRINCIPALS[@]}"
 	do
@@ -186,7 +188,9 @@ function buildImage {
 		sed -e "s=PRINCIPAL=${principal[0]}=g"		\
 		-e "s=PASSWORD=${principal[1]}=g")		\
 		>>$TEMP_PRINCIPALS
-		EXPORT_KEYTAB+=$(echo " ${principal[0]}")
+		PRINC_TMP=$(echo ${principal[0]} | sed -e 's+/+_+g')
+		EXPORT_KEYTAB_LIST[$IDX]="${EXPORT_KEYTAB_CMD}.$PRINC_TMP ${principal[0]}"
+		IDX=$((IDX+1))
 	done
 
 	local DOCKER_FILE=$(<$KDC_TEMPLATES_DIR/Dockerfile)
@@ -194,15 +198,22 @@ function buildImage {
 
 	DOCKER_FILE=$(echo "${DOCKER_FILE//PRINCIPALS/$ADD_PRINCIPALS}")
 	DOCKER_FILE=$(echo "${DOCKER_FILE//REALM/$KDC_REALM_NAME}")
-	DOCKER_FILE=$(echo "${DOCKER_FILE//EXPORT_KEYTAB/$EXPORT_KEYTAB}")
+	CMD_LIST=$(echo "RUN mkdir /etc/lustre-docker-kdc/Keytabs ${EXPORT_KEYTAB_LIST[@]}" | sed -e 's+ RUN+\nRUN+g')
+	DOCKER_FILE=$(echo "${DOCKER_FILE//EXPORT_KEYTAB/$CMD_LIST}")
 	echo $DOCKER_FILE > Dockerfile
 
 	rm -f $TEMP_PRINCIPALS
 
-	sed -e "s=HOST_NAME=$KDC_HOST_NAME=g" 				\
+	if [ -z "$KDC_DOMAIN_NAME" ]; then
+		sed "/DOMAIN_NAME/d" "$KDC_TEMPLATES_DIR/krb5.conf" >   \
+		krb5.conf
+	else
+		cp "$KDC_TEMPLATES_DIR/krb5.conf" krb5.conf
+	fi
+	sed -i -e "s=HOST_NAME=$KDC_HOST_NAME=g" 			\
 		-e "s=DOMAIN_NAME=$KDC_DOMAIN_NAME=g" 			\
 		-e "s=REALM_NAME=$KDC_REALM_NAME=g"			\
-		"$KDC_TEMPLATES_DIR/krb5.conf" >krb5.conf
+		krb5.conf
 
 	docker build -t $DOCKERIMAGE .
 	rm -f Dockerfile
@@ -210,17 +221,12 @@ function buildImage {
 }
 
 
-function testBoot2dockerActive {
-	boot2docker status &> /dev/null || boot2docker init
-	if [[ `boot2docker status` == "running" ]]; then
-		return 0
-	fi
-	return 1
-}
-
-
 function testKdcReachable {
 	local HOST=$($GET_KDC_HOST)
+	if ! type telnet >/dev/null 2>&1; then
+		echo "telnet is required, please install."
+		exit 2
+	fi
 	echo -n "at $HOST:$KDC_PORT... "
 	echo $'\n' $'\n' $'\n' | 			\
 		telnet $HOST $KDC_PORT 2>/dev/null |	\
@@ -234,35 +240,18 @@ function testKdcReachable {
 
 case "$1" in
 	start)
-		prepareDocker
 		startDocker
 		;;
 	stop)
-		prepareDocker
 		stopDocker
 		;;
 	clean)
-		prepareDocker
 		docker rmi -f $DOCKERIMAGE
 		;;
 	build)
-		prepareDocker
 		buildImage
 		;;
-	shellinit)
-		echo "    export KRB5_CONFIG=$(pwd)/krb5.conf"
-		echo "    export KRB5_KTNAME=$(pwd)/krb5.keytab"
-		;;
 	test)
-		if [[ $CONTAINER == "boot2docker" ]]; then
-			echo -n "Checking boot2docker active... "
-			if testBoot2dockerActive; then
-				echo "ok"
-			else
-				echo "failed"
-				exit 1
-			fi
-		fi
 		echo -n "Trying to connect to KDC... "
 		if testKdcReachable; then
 			echo "ok"
@@ -292,6 +281,6 @@ case "$1" in
 
 		;;
 	*)
-		echo "Usage: $0 start|stop|build|clean|config|test|shellinit"
+		echo "Usage: $0 start|stop|build|clean|config|test"
 		;;
 esac

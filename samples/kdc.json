@@ -1,12 +1,17 @@
 {
   "principals": [
     {
-      "id": "tillt/host.example.com@EXAMPLE.COM",
-      "password": "herbert"
+      "id": "lustre_mds/mds_server.example.com@EXAMPLE.COM"
     },
     {
-      "id": "tillt@EXAMPLE.COM",
-      "password": "herbert"
+      "id": "lustre_oss/oss_server.example.com@EXAMPLE.COM"
+    },
+    {
+      "id": "lustre_root/client_node.example.com@EXAMPLE.COM"
+    },
+    {
+      "id": "userA@EXAMPLE.COM",
+      "password": "dummy"
     }
   ],
   "domain": "example.com",

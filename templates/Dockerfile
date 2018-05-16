@@ -1,5 +1,4 @@
-FROM ubuntu:14.04
-MAINTAINER Till Toenshoff <@ttoenshoff>
+FROM ubuntu:16.04
 
 ARG DEBIAN_FRONTEND=noninteractive
 
@@ -12,7 +11,7 @@ RUN apt-get -y update && \
 EXPOSE	88
 
 # Create keytab folder.
-RUN mkdir /etc/docker-kdc
+RUN mkdir /etc/lustre-docker-kdc
 
 # Add kerberos principal/s.
 PRINCIPALS
